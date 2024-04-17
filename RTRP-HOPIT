@@ -1,0 +1,149 @@
+import numpy as np
+from scipy.stats import norm
+from scipy.optimize import minimize
+
+def halton_sequence(size, dimensions):
+    """
+    Generate Halton sequence of quasi-random numbers using prime numbers as bases.
+
+    Parameters:
+    - size (int): Number of points in the sequence.
+    - dimensions (int): Number of dimensions (coordinates) in each point.
+
+    Returns:
+    - numpy.ndarray: Halton sequence of shape (size, dimensions).
+    """
+    def halton_value(index, base):
+        """Compute the Halton value for a given index and base."""
+        result = 0
+        fraction = 1.0 / base
+        while index > 0:
+            result += (index % base) * fraction
+            index //= base
+            fraction /= base
+        return result
+
+    # Select the first `dimensions` prime numbers as bases
+    bases = [2, 3, 5, 7, 11, 13, 17, 19, 23][:dimensions]
+
+    # Generate Halton sequence
+    sequence = np.zeros((size, dimensions))
+    for i in range(size):
+        for j in range(dimensions):
+            sequence[i, j] = halton_value(i + 1, bases[j])
+
+    return sequence
+
+def random_parameters_ordered_probit(params, X, y, num_draws=500):
+    # Extract fixed coefficients for explanatory variables, thresholds, and threshold covariates
+    beta_fixed = params[:-3]
+    thresholds_fixed = params[-3]
+    beta_threshold_cov = params[-2]
+    std_dev_random = params[-1]
+
+    # Separate random parameters
+    beta_random = params[-4:-2]
+
+    # Generate Halton draws for optimization
+    halton_sequence_array = halton_sequence(num_draws, X.shape[1])
+
+    # Compute latent utilities for each draw
+    utilities = np.dot(X, beta_fixed) + np.dot(halton_sequence_array[:, :-1], beta_random)
+
+    # Compute random thresholds based on threshold covariates
+    thresholds_random = thresholds_fixed + np.dot(X, beta_threshold_cov)
+
+    # Compute cumulative probabilities
+    cdf_values = norm.cdf(thresholds_random[:, np.newaxis] - utilities)
+
+    # Calculate log-likelihood for each observation and each draw
+    log_likelihood_draws = []
+    for draw in range(num_draws):
+        log_likelihood_draw = 0.0
+        for i in range(len(y)):
+            if y[i] == 0:
+                prob = cdf_values[i, 0]
+            elif y[i] == 2:
+                prob = 1 - cdf_values[i, 1]
+            else:
+                prob = cdf_values[i, y[i]] - cdf_values[i, y[i] - 1]
+            log_likelihood_draw += np.log(prob + 1e-20)  # Add small number to avoid log(0)
+        log_likelihood_draws.append(log_likelihood_draw)
+
+    # Compute mean log-likelihood across draws
+    log_likelihood = np.mean(log_likelihood_draws)
+
+    return -log_likelihood  # Minimize negative mean log-likelihood for MLE
+
+def estimate_random_parameters_ordered_probit(X, y, num_draws=500):
+    # Number of features
+    n_features = X.shape[1]
+
+    # Initial guess for parameters (beta, thresholds, random params, std dev for random params)
+    initial_params = np.random.randn(n_features + 4)  # beta + thresholds + random params + std dev + threshold covariates
+
+    # Compute initial log likelihood
+    initial_log_likelihood = random_parameters_ordered_probit(initial_params, X, y, num_draws)
+
+    # Perform Maximum Likelihood Estimation (MLE) using Halton sequences
+    result = minimize(random_parameters_ordered_probit, initial_params, args=(X, y, num_draws),
+                      method='BFGS', options={'disp': True})
+
+    # Extract converged log likelihood
+    converged_log_likelihood = -result.fun
+
+    # Calculate standard errors using the Hessian matrix from the optimization result
+    cov_matrix = np.linalg.inv(result.hess_inv)
+
+    # Extract parameters from the optimization result
+    estimated_params = result.x
+    beta_fixed = estimated_params[:-4]
+    thresholds_fixed = estimated_params[-4]
+    beta_threshold_cov = estimated_params[-3]
+    beta_random = estimated_params[-4:-2]
+    std_dev_random = estimated_params[-2]
+
+    # Extract standard errors for fixed coefficients, thresholds, and random coefficients
+    se_beta_fixed = np.sqrt(np.diag(cov_matrix[:-4, :-4]))
+    se_thresholds_fixed = np.sqrt(cov_matrix[-4, -4])
+    se_beta_threshold_cov = np.sqrt(cov_matrix[-3, -3])
+    se_beta_random = np.sqrt(np.diag(cov_matrix[-2:, -2]))
+
+    # Calculate t-values for thresholds, fixed coefficients, threshold covariates, and random coefficients
+    t_value_thresholds_fixed = thresholds_fixed / se_thresholds_fixed
+    t_value_beta_fixed = beta_fixed / se_beta_fixed
+    t_value_beta_threshold_cov = beta_threshold_cov / se_beta_threshold_cov
+    t_value_beta_random = beta_random / se_beta_random
+
+    return (result, initial_log_likelihood, converged_log_likelihood,
+            beta_fixed, se_beta_fixed, t_value_beta_fixed,
+            thresholds_fixed, se_thresholds_fixed, t_value_thresholds_fixed,
+            beta_threshold_cov, se_beta_threshold_cov, t_value_beta_threshold_cov,
+            beta_random, std_dev_random, se_beta_random, t_value_beta_random)
+
+# Example usage:
+# Assuming X and y are numpy arrays for independent variables and dependent variable
+X = np.array([[1, 2], [3, 4], [5, 6]])
+y = np.array([0, 1, 2])
+
+# Estimate the random parameters ordered probit model with Halton sequences and random thresholds
+(result, initial_log_likelihood, converged_log_likelihood,
+ beta_fixed, se_beta_fixed, t_value_beta_fixed,
+ thresholds_fixed, se_thresholds_fixed, t_value_thresholds_fixed,
+ beta_threshold_cov, se_beta_threshold_cov, t_value_beta_threshold_cov,
+ beta_random, std_dev_random, se_beta_random, t_value_beta_random) = estimate_random_parameters_ordered_probit(X, y)
+
+# Display results
+print("Initial log-likelihood:", initial_log_likelihood)
+print("Converged log-likelihood:", converged_log_likelihood)
+print("\nFixed Coefficients:")
+print("Estimated beta_fixed:", beta_fixed)
+print("Standard Errors (se_beta_fixed):", se_beta_fixed)
+print("t-values (t_value_beta_fixed):", t_value_beta_fixed)
+print("\nThresholds:")
+print("Estimated thresholds_fixed:", thresholds_fixed)
+print("Standard Error (se_thresholds_fixed):", se_thresholds_fixed)
+print("t-value (t_value_thresholds_fixed):", t_value_thresholds_fixed)
+print("\nThreshold Covariates:")
+print("Estimated beta_threshold_cov:", beta_threshold_cov)
+print("Standard Error (se_beta_threshold_cov):", se_beta_threshold
